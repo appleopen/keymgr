@@ -31,8 +31,8 @@ Software Foundation, 59 Temple Place - Suite 330, Boston, MA
    old_object'.  It was taken from unwind-dw2-fde.h from GCC 3.1.  */
 
 /*
- * keymgr - Create and maintain process-wide global data known to 
- *	    all threads across all dynamic libraries. 
+ * keymgr - Create and maintain process-wide global data known to
+ *	    all threads across all dynamic libraries.
  *
  */
 
@@ -41,601 +41,540 @@ Software Foundation, 59 Temple Place - Suite 330, Boston, MA
 #include <stdlib.h>
 #include "keymgr.h"
 
-/*
- * __keymgr_global - contains pointers to keymgr data that needs to be 
- * global and known across all dlls/plugins. The array elements are defined
- * as follows:
- * Element #0:	A pthreads semaphore for accessing the keymgr global data.
- *		This would replace keymgr static semaphore.
- *
- * Element #1:	Pointer to keymgr global list. This pointer was previously
- *		contained in __eh_global_dataptr.
- *
- * Element #2:	Pointer to keymgr information node. This is a new pointer.
- *		initially the information node would contain two fields:
- *		The number of words in the information node and 
- *		an API version number.
- *
- */
+#ifndef ESUCCESS
+#define ESUCCESS 0
+#endif
 
-void *__keymgr_global[3] = { (void *) 0 };
+/* Types of node, used for error checking.  */
+typedef enum node_kinds {
+  NODE_THREAD_SPECIFIC_DATA=1,
+  NODE_PROCESSWIDE_PTR
+} TnodeKind;
 
-#define GET_KEYMGR_LIST_ROOT()		((_Tkey_Data *)__keymgr_global[1])
-#define SET_KEYMGR_LIST_ROOT(ptr)	(__keymgr_global[1] = ((void *) (ptr)))
+/* These values are internal; the subflags of NM_ENHANCED_LOCKING are
+   defined in keymgr.h and are not internal.  */
+enum {
+  NM_ENHANCED_LOCKING=3
+};
 
-#define GET_KEYMGR_LIST_MUTEX_PTR()	((pthread_mutex_t *) __keymgr_global[0])
-#define SET_KEYMGR_LIST_MUTEX_PTR(ptr)	(__keymgr_global[0] = (void *)(ptr))
-#define INIT_KEYMGR_LIST_MUTEX()	(SET_KEYMGR_LIST_MUTEX_PTR(malloc(sizeof(pthread_mutex_t))), \
-					 (*GET_KEYMGR_LIST_MUTEX_PTR() = _local_mutex_initializer))
-#define LOCK_KEYMGR_LIST_MUTEX()	(pthread_mutex_lock(GET_KEYMGR_LIST_MUTEX_PTR()) ? \
-					 (abort(), 0) : 0 )
-#define UNLOCK_KEYMGR_LIST_MUTEX()	(pthread_mutex_unlock(GET_KEYMGR_LIST_MUTEX_PTR()) ? \
-					 (abort(), 0) : 0 )
+/* Base node kind for keymgr node list; also used to represent per
+   thread variables (NODE_THREAD_SPECIFIC_DATA).  */
 
+typedef struct Skey_data {
+  struct Skey_data * next;
+  unsigned int handle;		/* Key id of variable.  */
+  unsigned char node_kind;	/* What kind of variable is this?  */
+  unsigned char flags;		/* Flags controlling behavior of variable.  */
+  unsigned short refcount;	/* If recursion has been enabled, reference
+				   count.  */
+  void *ptr;			/* Data associated with variable.  */
+  pthread_mutex_t thread_lock;	/* Semaphore for this specific variable.  */
+} Tkey_Data;
 
-#define LOCK_KEYMGR_INIT()	(pthread_mutex_lock(&_keymgr_init_lock) ? (abort(), 0) : 0 )
-#define UNLOCK_KEYMGR_INIT()	(pthread_mutex_unlock(&_keymgr_init_lock) ? (abort(), 0) : 0 )
+typedef struct Sinfo_Node {
+  unsigned int size; 		/* Size of this node.  */
+  unsigned short major_version; /* API major version.  */
+  unsigned short minor_version;	/* API minor version.  */
+} Tinfo_Node;
 
-#define KEYMGR_CREATE_THREAD_DATA_KEY(thread_key) \
-		((pthread_key_create(&thread_key,NULL) != 0) ?  \
-				(abort(),0) : 0) 
+/* Static variables for initial __keymgr_global values.  */
 
-/* Version of the above which specifies free () as the destructor.  */
-#define KEYMGR_CREATE_MALLOCED_THREAD_DATA_KEY(thread_key) \
-		((pthread_key_create(&thread_key, free) != 0) ?  \
-				(abort(),0) : 0) 
+static const Tinfo_Node keymgr_info = {
+  sizeof (Tinfo_Node),
+  KEYMGR_API_REV_MAJOR,
+  KEYMGR_API_REV_MINOR
+};
 
-#define KEYMGR_SET_THREAD_DATA(key,data)	\
-		 ((pthread_setspecific((key), (data)) != 0) ? \
-				(abort(),0) : 0)
-											
-#define KEYMGR_GET_THREAD_DATA(key)	(pthread_getspecific(key))
-					 
-#define INIT_KEYMGR_NODE_LOCK(node)	(node->thread_lock = _local_mutex_initializer) 
+/* __keymgr_global - contains pointers to keymgr data that needs to be
+   global and known across all dlls/plugins.  */
+struct {
+  /* Formerly, a pthreads semaphore for accessing the keymgr global data.  
+     Now unused.  */
+  void *unused;
 
-#define LOCK_KEYMGR_NODE(node)		\
-		((pthread_mutex_lock(&(node->thread_lock)) ? \
-		(abort(), 0) : 0 ),((node)->flags |= NM_LOCKED),\
-		((node)->owning_thread = pthread_self()),node->refcount++)
-					 					
-#define UNLOCK_KEYMGR_NODE(node)	\
-		(((node)->flags &= ~NM_LOCKED),((node)->refcount--),\
-		 (pthread_mutex_unlock(&(node->thread_lock)) ? \
-				 (abort(), 0) : 0 ))
-					 					 
-#define LOCK_IS_MINE(node)	(((node)->flags & NM_LOCKED)&& \
-				 ((node)->owning_thread == pthread_self()))
-					 
-#define GET_KEYMGR_INFO_NODE_PTR()	((_Tinfo_Node *)__keymgr_global[2])
-#define SET_KEYMGR_INFO_NODE_PTR(ptr)	(__keymgr_global[2] = (void *)(ptr))
+  /* Pointer to keymgr global list.  This pointer was previously
+     contained in __eh_global_dataptr.  */
+  Tkey_Data * volatile keymgr_globals;
 
+  /* Pointer to keymgr information node.  This is part of the semi-public
+     ABI of keymgr.  */
+  const Tinfo_Node *keymgr_info;
+} __attribute__((aligned (32))) __keymgr_global = {
+  NULL,
+  NULL,
+  &keymgr_info
+};
 
-#define CHECK_KEYMGR_INIT()		if (!_keymgr_init_mutex) _init_keymgr() ;
+#define UNLOCK_KEYMGR_LIST_MUTEX()			\
+  (pthread_mutex_unlock (__keymgr_global.keymgr_mutex) 	\
+   ? (abort (), 0) : 0)
 
-#define KEYMGR_NODE_FLAGS(node,pflags)	((node)->flags & (pflags))
+#if defined(__ppc__) || defined(__i386__)
+/* Initialize keymgr.  */
 
-static int _keymgr_init_mutex = 0 ;
+void _init_keymgr (void)
+{
+  /* This routine is now empty, but is part of keymgr's ABI on ppc and
+     so can't be completely removed.  */
+}
+#endif
 
-static pthread_mutex_t _local_mutex_initializer = PTHREAD_MUTEX_INITIALIZER ;
-static pthread_mutex_t _keymgr_init_lock = PTHREAD_MUTEX_INITIALIZER ;
+/* Helper routines for atomic operations.  These have to be ported
+   for each platform...  */
+#if defined (__ppc64__)
+static inline void *
+compare_and_swap (void * volatile * p, void *old, void *new) 
+{
+  void *result;
+  asm ("0:	ldarx %0,0,%2\n"
+       "	cmpd%I3 %0,%3\n"
+       "	bne 1f\n"
+       "	stdcx. %4,0,%2\n"
+       "	bne- 0b\n"
+       "1:"
+       : "=&r" (result), "+m"(*p)
+       : "b" (p), "rI" (old), "r" (new)
+       : "cr0");
+  return result;
+}
 
-/*
- * Base node kind for keymgr node list.
- * Also used to represent per thread variables (NODE_THREAD_SPECIFIC_DATA)
- */
- 
-typedef struct _Skey_data {
-	struct _Skey_data *next ;
-	unsigned int handle ;		/*key id of variable.*/
-	void *ptr ;			/*Pointer to variable data (or variable data).*/
-	TnodeKind node_kind;		/*What kind of variable is this?*/
-	pthread_mutex_t thread_lock;	/*Semaphore for this specific variable.*/
-	pthread_t owning_thread ;	/*the thread that owns, if tracking enabled.*/
-	unsigned int refcount ;		/*If recursion has been enabled, reference count.*/
-	unsigned int flags ;		/*Flags controlling behavior of variable.*/
-	} _Tkey_Data ;
+static inline void
+atomic_list_insert (Tkey_Data * volatile *list_base,
+		    Tkey_Data * * next,
+		    Tkey_Data * current)
+{
+  Tkey_Data *temp;
+  asm ("0:	ldarx %0,0,%3\n"
+       "	std%U1%X1 %0,%1\n"
+       "	sync\n"
+       "	stdcx. %4,0,%3\n"
+       "	bne- 0b"
+       : "=&r" (temp), "=m" (*next), "+m" (*list_base)
+       : "b" (list_base), "r" (current));
+}
 
-	
-typedef struct _Sinfo_Node {
-	unsigned int size ; 		/*size of this node*/
-	unsigned short major_version ; 	/*API major version.*/
-	unsigned short minor_version ;	/*API minor version.*/
-	} _Tinfo_Node ;
-	
+#elif defined (__ppc__)
+static inline void *
+compare_and_swap (void * volatile * p, void *old, void *new) 
+{
+  void *result;
+  asm ("0:	lwarx %0,0,%2\n"
+       "	cmpw%I3 %0,%3\n"
+       "	bne 1f\n"
+       "	stwcx. %4,0,%2\n"
+       "	bne- 0b\n"
+       "1:"
+       : "=&r" (result), "+m"(*p)
+       : "b" (p), "rI" (old), "r" (new)
+       : "cr0");
+  return result;
+}
 
-/*
- * Initialize keymgr and its related semaphore. 
- * It is very important that the client be running
- * single threaded until this initialization completes.
- * Thus, threads should not be spawned at module initialization time.
- */
+static inline void
+atomic_list_insert (Tkey_Data * volatile *list_base,
+		    Tkey_Data * * next,
+		    Tkey_Data * current)
+{
+  Tkey_Data *temp;
+  asm ("0:	lwarx %0,0,%3\n"
+       "	stw%U1%X1 %0,%1\n"
+       "	sync\n"
+       "	stwcx. %4,0,%3\n"
+       "	bne- 0b"
+       : "=&r" (temp), "=m" (*next), "+m" (*list_base)
+       : "b" (list_base), "r" (current));
+}
 
+#elif defined (__i386__)
+static inline void *
+compare_and_swap (void * volatile * p, void *old, void *new)
+{
+  void *result;
+  asm ("lock ; cmpxchgl %3,%1"
+       : "=a" (result), "+m"(*p)
+       : "0" (old), "r" (new));
+  return result;
+}
 
-void _init_keymgr(void) {
+static inline void
+atomic_list_insert (Tkey_Data * volatile *list_base,
+		    Tkey_Data * * next,
+		    Tkey_Data * current)
+{
+  do {
+    *next = *list_base;
+  } while (compare_and_swap ((void * volatile *)list_base, 
+			     *next, current) != *next);
+}
+#else
+#error architecture not supported
+#endif
 
-	_Tinfo_Node *ti ;
-	unsigned long address ;
-	void *module ;
+/* Helper routine for get_key_element and get_or_create_key_element.
+   Return the node corresponding to KEY, or NULL if none exists.  */
 
+static Tkey_Data *
+find_key_data (unsigned int key)
+{
+  Tkey_Data * keyArray;
 
-	/* this semaphore is just an accelerator to prevent repeated calls to pthreads.*/
-	
-	if (_keymgr_init_mutex)
-		return ;
+  for (keyArray = __keymgr_global.keymgr_globals;
+       keyArray != NULL;
+       keyArray = keyArray->next)
+    if (keyArray->handle == key)
+      break;
 
-	/*
-	 * If keymgr is living in system framework, it must be fully bound 
-	 * before being used. Because calling dyld could cause another
-	 * user initialization routine to run, we don't set the initialization
-	 * semaphore until we get back. Once we are back, we are gauranteed not to
-	 * recurse. We then only have to worry about other threads.
-	 */
+  return keyArray;
+}
 
-	_dyld_lookup_and_bind_fully("__init_keymgr", &address, &module); 
-	
+/* Find any Tkey_Data associated with KEY.  If none exists, or KIND
+   does not match, return NULL.  */
 
-	/*
-	 * Check to see if a recursion occured and ran the initialization.
-	 */
-	 		
-	if (_keymgr_init_mutex)
-		return ;
+static Tkey_Data *
+get_key_element (unsigned int key, TnodeKind kind)
+{
+  Tkey_Data  *keyArray;
 
-	 /*Lock out other threads.*/
-	LOCK_KEYMGR_INIT() ;
-	
-	/*
-	 * Check and see if another thread has already done the job.
-	 */
-	 
-	if (_keymgr_init_mutex) {
-		UNLOCK_KEYMGR_INIT() ;
-		return ;
-		}
+  keyArray = find_key_data (key);
 
-	_keymgr_init_mutex++ ;
-	
-	/* 
-	 * now we check to see if another instance has already initialized keymgr.
-	 * If keymgr is in the system framework, this will always be false.
-	 */
-	
-	if (GET_KEYMGR_INFO_NODE_PTR()) {
-		UNLOCK_KEYMGR_INIT() ;
-		return ;
-		}
-		
-	INIT_KEYMGR_LIST_MUTEX() ;
-	LOCK_KEYMGR_LIST_MUTEX() ;
-	ti = malloc(sizeof(_Tinfo_Node)) ;
-	ti->size = sizeof(_Tinfo_Node) ;
-	ti->major_version = KEYMGR_API_REV_MAJOR ;
-	ti->minor_version = KEYMGR_API_REV_MINOR ;
-	SET_KEYMGR_INFO_NODE_PTR(ti) ;
-	UNLOCK_KEYMGR_LIST_MUTEX() ;
+  if (keyArray != NULL && keyArray->node_kind != kind)
+    keyArray = NULL;
 
-	UNLOCK_KEYMGR_INIT() ;
+  return keyArray;
+}
+
+/* Find any Tkey_Data associated with KEY.  If none exists, create one
+   and add it to the list.  Put it in *RESULT.
+
+   On success, return 0, otherwise:
+   [EINVAL]  The node existed but was not of type KIND.
+   [ENOMEM]  Out of memory, couldn't create node.
+   [EAGAIN]  The mutex associated with the new node couldn't be created.
+	     This can only happen when KIND == NODE_PROCESSWIDE_PTR.
+*/
+
+static int
+get_or_create_key_element (unsigned int key, TnodeKind kind, 
+			   Tkey_Data **result)
+{
+  Tkey_Data *keyArray;
+
+  keyArray = find_key_data (key);
+
+  if (keyArray == NULL)
+    {
+      keyArray = (Tkey_Data *) malloc (sizeof (Tkey_Data));
+      if (keyArray == NULL)
+	return ENOMEM;
+      
+      if (keyArray != NULL
+	  && kind == NODE_PROCESSWIDE_PTR)
+	{
+	  pthread_mutexattr_t attr;
+	  int errnum;
+	  
+	  keyArray->refcount = 0;
+	  keyArray->flags = 0;
+
+	  errnum = pthread_mutexattr_init (&attr);
+	  if (errnum == ESUCCESS)
+	    {
+	      pthread_mutexattr_settype (&attr, PTHREAD_MUTEX_ERRORCHECK);
+	      errnum = pthread_mutex_init (&keyArray->thread_lock, &attr);
+	      pthread_mutexattr_destroy (&attr);
+	    }
+	  if (errnum != ESUCCESS)
+	    {
+	      free (keyArray);
+	      return errnum;
+	    }
 	}
 
-
-/*
- * Try to get module initialization to initialize keymgr before 
- * anyone uses it. If not, the api calls check for lack of initialization
- * force initialization to occur anyway. Initialization invoked
- * by the API calls is more dangerous since there is a small
- * window where two threads could simultaneously enter the 
- * initialization region. In general, to be safe,
- * this initialization should be run before multi-threading
- * is started.
- */	
-	
-#pragma CALL_ON_LOAD	_init_keymgr
-
-/*
- * These routines provide  customized locking and
- * unlocking services. If enhanced locking is chosen
- * then recursion can be allowed or disallowed.
- */
- 
-static void _keymgr_lock(_Tkey_Data *node) {
-
-	if (KEYMGR_NODE_FLAGS(node,NM_ENHANCED_LOCKING)) {
-		if (LOCK_IS_MINE(node)) {
-			if (KEYMGR_NODE_FLAGS(node,NM_RECURSION_ILLEGAL)) {
-				abort() ;
-				}
-			else if (KEYMGR_NODE_FLAGS(node,NM_ALLOW_RECURSION)) {
-				if(node->refcount) {
-					node->refcount++ ;
-					return ;
-					}
-				}
-				
-			else ;
-			}
-		}
-		
-	else ;
-		
-		
-	LOCK_KEYMGR_NODE(node) ;
-	}
-	
-	
-static void _keymgr_unlock(_Tkey_Data *node) {
-
-	if (node->refcount > 1) {
-		node->refcount-- ;
-		return ;
-		}
-
-	UNLOCK_KEYMGR_NODE(node) ;
-	}
-	
-	
-/*
- * These routines are the layer 1 (lowest level) routines.
- * No layer 1 routine should perform any locking/unlocking.
- */
-
-
-static _Tkey_Data *_keymgr_get_key_element(unsigned int key) {
-
-	_Tkey_Data  *keyArray ;
-
-	for (keyArray = GET_KEYMGR_LIST_ROOT()  ; keyArray != NULL ; keyArray = keyArray->next) {
-	      if (keyArray->handle == key)
-		 break ;
-	      }
-
-	return(keyArray) ;
-	}
-    
-
-
-static _Tkey_Data *_keymgr_create_key_element(unsigned int key, void *ptr, TnodeKind kind) {
-
-	_Tkey_Data  *keyArray ;
-
-	keyArray = (_Tkey_Data *) malloc(sizeof(_Tkey_Data)) ;
-	keyArray->handle = key ;
-	keyArray->ptr = ptr ;
-	keyArray->node_kind = kind ;
-	keyArray->owning_thread = pthread_self() ;
-	keyArray->refcount = 0;
-	keyArray->flags = 0 ;
-	INIT_KEYMGR_NODE_LOCK(keyArray) ;
-	keyArray->next = GET_KEYMGR_LIST_ROOT() ;
-	SET_KEYMGR_LIST_ROOT(keyArray) ;
-
-	return(keyArray) ;
-	}
-
-
-
-static _Tkey_Data *_keymgr_set_key_element(unsigned int key, void *ptr, TnodeKind kind) {
-
-
-	_Tkey_Data  *keyArray ;
-
-	keyArray = _keymgr_get_key_element(key) ; 
-	   
-	if (keyArray == NULL) {
-	   keyArray = _keymgr_create_key_element(key,ptr,kind) ;
-	   }
-	   
-	else if (keyArray->node_kind != kind) {
-		abort() ;
-		}
-
-	else {
-	   keyArray->ptr = ptr ;
-	   }
-
-	return(keyArray) ;
-
-	}
-
-static _Tkey_Data *_keymgr_get_or_create_key_element(unsigned int key, TnodeKind kind) {
-
-	_Tkey_Data  *keyArray ;
-
-	LOCK_KEYMGR_LIST_MUTEX() ;
-    keyArray = _keymgr_get_key_element(key) ;
-
-    if (keyArray == NULL) {
-       keyArray = _keymgr_create_key_element(key, NULL, kind) ;
-       }
-       
-    else if (kind && (keyArray->node_kind != kind))
-    	abort() ;
-    	
-    else ;
-
-	UNLOCK_KEYMGR_LIST_MUTEX() ;
-	return(keyArray) ;
-	}
-	
-
-/*
- * External interfaces to keymgr. 
- * The purpose of these routines is to store
- * runtime information in a global place 
- * accessible from all threads and all dlls.
- * Thread safety is guaranteed.
- * _keymgr_get_key must be called first. It locks all keys
- * and returns the value of the specified key.
- * Next either _keymgr_unlock_keys can be called to unlock
- * the keys and allow them to change in value or
- * _keymgr_set_key can be called to set the value
- * of the key and then unlock all keys. The key number itself
- * is determined by the user. To prevent collisions, register
- * your key via a define in keymgr.h. The first use of
- * a key causes a memory location for the key value
- * to be reserved. As long as no key number collision
- * occurs, this interface allows different versions
- * of the runtime to exists together.
- */
-
-static void *_keymgr_get_and_lock_key(unsigned int key, TnodeKind kind) {
-
-    _Tkey_Data *keyArray ;
-    void *retptr ;
-
-	keyArray = _keymgr_get_or_create_key_element(key,kind) ;
-	_keymgr_lock(keyArray) ;
-
-    retptr = keyArray->ptr ;
-
-    return(retptr) ;
+      keyArray->handle = key;
+      keyArray->ptr = NULL;
+      keyArray->node_kind = kind;
+      atomic_list_insert (&__keymgr_global.keymgr_globals,
+			  &keyArray->next,
+			  keyArray);
     }
+  else if (keyArray->node_kind != kind)
+    return EINVAL;
+  
+  *result = keyArray;
+  return ESUCCESS;
+}
+	
 
-static void _keymgr_unlock_key(unsigned int key) {
+/* Return the data associated with KEY for the current thread.
+   Return NULL if there is no such data.  */
 
-    _Tkey_Data *keyArray ;
-    LOCK_KEYMGR_LIST_MUTEX() ;
-    keyArray = _keymgr_get_key_element(key) ;
-    UNLOCK_KEYMGR_LIST_MUTEX() ;
-    if (keyArray)
-		_keymgr_unlock(keyArray) ;
-    }
-    
+void *
+_keymgr_get_per_thread_data (unsigned int key)
+{
+  Tkey_Data * keyArray;
+  void * key_data;
 
+  keyArray = get_key_element (key, NODE_THREAD_SPECIFIC_DATA);
 
+  /* If the element hasn't been set, the answer is always NULL.  */
+  if (keyArray == NULL)
+    return NULL;
 
-static void *_keymgr_set_and_unlock_key(unsigned int key, void *ptr, TnodeKind kind) {
+  /* On all platforms we run on, a pointer-sized load from an aligned
+     address is atomic.  */
+  key_data = keyArray->ptr;
 
-    _Tkey_Data *keyArray ;
-    void * retptr ;
+  /* key_data might be NULL if this entry is in the process of being
+     created.  In that case, return NULL.  */
+  if (key_data == NULL)
+    return NULL;
 
-	LOCK_KEYMGR_LIST_MUTEX() ;
+  return pthread_getspecific ((pthread_key_t) key_data);
+}
 
-    keyArray = _keymgr_set_key_element(key, ptr, kind) ;
+/* Set the data for KEY for this thread to be KEYDATA.  Return 0 on success,
+   or:
 
-    retptr = keyArray->ptr ;
+   [ENOMEM]  Out of memory.
+   [EINVAL]  The KEY was previously used to store process-wide data.
+   [EAGAIN]  The system lacked the necessary resources to create
+             another thread-specific data key, or the system- imposed
+             limit on the total number of keys per process
+             [PTHREAD_KEYS_MAX] would be exceeded.  This error can't
+             happen after the first successful call to
+             _keymgr_set_per_thread_data from a particular thread with
+             a particular KEY.
+*/
 
-    UNLOCK_KEYMGR_LIST_MUTEX() ;
-    _keymgr_unlock(keyArray) ;
-    
-    return(retptr) ;
-    }
+int
+_keymgr_set_per_thread_data (unsigned int key, void *keydata)
+{
+  volatile Tkey_Data * keyArray;
+  pthread_key_t pthread_key;
+  void *ptr;
+  int errnum;
 
-/*
- * The following routines allow the user to store per thread
- * data using a key of the user's choice. 
- *
- * _keymgr_init_per_thread_data creates a pthread's key
- * if it doesn't exist already. The data associated with
- * the pthreads' key is initialized to NULL. The pthread key
- * is associated with the specified keymgr key. The key must have
- * been locked by a _keymgr_get_and_lock_key operation.
- * The key will be returned unlocked. 
- *
- * _keymgr_get_per_thread_data lock's the user's key
- * and maps it to a pthreads' key. The pthreads' data associated
- * with that key is returned. The user key is then unlocked.
- *
- * _keymgr_set_per_thread_data lock's the user's key
- * and maps it to a pthreads' key. The argument data is then
- * used to update the data associated with the pthreads' key.
- * Then the user's key is unlocked.
- *
- */
+  errnum = get_or_create_key_element (key, NODE_THREAD_SPECIFIC_DATA,
+				      (Tkey_Data **)&keyArray);
+  if (errnum != ESUCCESS)
+    return errnum;
 
+  /* This routine doesn't lock *keyArray.  Instead, it relies on the
+     fact that keyArray->ptr is either NULL or a valid pthread key value,
+     and it only changes once, from NULL to a valid value.  */
 
-static void _keymgr_init_per_thread_data(unsigned int key) {
+  ptr = keyArray->ptr;
+  if (ptr == NULL)
+    {
+      void (*destructor)(void *);
 
-     pthread_key_t pthread_key ;
-     _Tkey_Data *keyArray ;
-     
-
-	/*
-	 * Caller insures that node has been created already.
-	 */
-	 
-	LOCK_KEYMGR_LIST_MUTEX() ;
-	keyArray = _keymgr_get_key_element(key) ;
-    UNLOCK_KEYMGR_LIST_MUTEX() ;
-    
-    /*
-     * The caller has already created a node, if it didn't
-     * exist, and has locked it in all cases.
-     */
-    
-    pthread_key = (pthread_key_t) keyArray->ptr ;
-    if (pthread_key == NULL) {
-	    switch (key) {
-			case KEYMGR_EH_CONTEXT_KEY:
-				KEYMGR_CREATE_MALLOCED_THREAD_DATA_KEY (pthread_key);
-				break;
-			default:
-				KEYMGR_CREATE_THREAD_DATA_KEY(pthread_key) ;
-				break;
-			}
-		_keymgr_set_and_unlock_key(key,(void *) pthread_key, NODE_THREAD_SPECIFIC_DATA) ;
-		}
-
-    else {
-    	/*
-    	 * since we are done messing around with the key itself, 
-    	 * we can unlock it.
-    	 */
-    	_keymgr_unlock(keyArray) ;
-    	
-    	/* Now we set the data associated with the key to NULL.*/
-    	
-    	KEYMGR_SET_THREAD_DATA(pthread_key, NULL) ;
-		}
-
-    }
-
- 
-void * _keymgr_get_per_thread_data(unsigned int key) {
-
-    pthread_key_t pthread_key ;
-    void * pthread_data ;
-
-     
-     _init_keymgr() ; /*confirm keymgr has been initialized.*/
-
-    pthread_key = (pthread_key_t) _keymgr_get_and_lock_key(key,NODE_THREAD_SPECIFIC_DATA) ;
-
-	/*
-	 * If the user key has not had a pthread's key associated
-	 * with it, do so now.
-	 */
-    if (pthread_key == NULL) {
-		_keymgr_init_per_thread_data(key) ; /*unlocks keys.*/
-		pthread_data = NULL ;
-		}
-
-	/*
-	 * The key can be unlocked because now we are just
-	 * dealing with the current thread's data.
-	 */
-    else {
-		_keymgr_unlock_key(key) ;
-		pthread_data = KEYMGR_GET_THREAD_DATA(pthread_key) ;
-		}
-
-    return(pthread_data) ;
-    }
-
-
-void _keymgr_set_per_thread_data(unsigned int key, void *keydata) {
-
-	pthread_key_t pthread_key ;
-
-     
-     _init_keymgr() ; /*confirm keymgr has been initialized.*/
-
-	pthread_key = (pthread_key_t) _keymgr_get_and_lock_key(key,NODE_THREAD_SPECIFIC_DATA) ;
-
-	if (pthread_key == NULL) {
-		_keymgr_init_per_thread_data(key) ;
-		}
-
-	/*
-	 * The key can be unlocked because now we are just
-	 * dealing with the current thread's data.
-	 */
-	_keymgr_unlock_key(key) ;
-
-	KEYMGR_SET_THREAD_DATA(pthread_key, keydata) ;
-
+      switch (key)
+	{
+	case KEYMGR_EH_CONTEXT_KEY:
+	  destructor = free;
+	  break;
+	default:
+	  destructor = NULL;
+	  break;
 	}
+      if ((errnum = pthread_key_create (&pthread_key, destructor)) != 0)
+	return errnum;
+      ptr = compare_and_swap (&keyArray->ptr, NULL, (void *)pthread_key);
+      if (ptr != NULL)
+	pthread_key_delete (pthread_key);
+    }
+  if (ptr != NULL)
+    pthread_key = (pthread_key_t) ptr;
+
+  return pthread_setspecific (pthread_key, keydata);
+}
 
 
 /*
  * These routines provide management of a process wide, thread safe,
  * persistent pointer. If a pointer is created by a bundle/plug-in
- * and placed in here, it will persist for the life of the process, 
+ * and placed in here, it will persist for the life of the process,
  * even after the bundle has been unloaded. This is especially useful
- * for data shared across plugins and across repeated plugin loads and 
+ * for data shared across plugins and across repeated plugin loads and
  * unloads.
  */
 
+/* Get the processwide data associated with KEY into *RESULT,
+   and lock a lock associated with KEY.  
 
+   On success, return 0, otherwise:
 
-void *_keymgr_get_and_lock_processwide_ptr(unsigned int key) {
+   [EINVAL]  KEY was previously used to store thread-specific data.
+   [ENOMEM]  Out of memory, couldn't create node.
+   [EAGAIN]  The mutex associated with the new node couldn't be created.
+   [EDEADLK] A deadlock would occur if the thread blocked waiting
+   	     for the lock.
+*/
 
-	void * retptr ;
+int
+_keymgr_get_and_lock_processwide_ptr_2 (unsigned int key, void ** result)
+{
+  Tkey_Data *keyArray;
+  int errnum;
+
+  errnum = get_or_create_key_element (key, NODE_PROCESSWIDE_PTR, &keyArray);
+  if (errnum != ESUCCESS)
+    return errnum;
+
+  if ((errnum = pthread_mutex_lock (&keyArray->thread_lock)) != ESUCCESS)
+    return errnum;
+
+  keyArray->refcount++;
+  *result = keyArray->ptr;
+  return ESUCCESS;
+}
+
+/* For backwards compatibility; like _keymgr_get_and_lock_processwide_ptr_2
+   but returns the pointer or NULL on error.  */
+
+void *
+_keymgr_get_and_lock_processwide_ptr (unsigned int key)
+{
+  void *result = NULL;
+  _keymgr_get_and_lock_processwide_ptr_2 (key, &result);
+  return result;
+}
+
+/* Unlock the lock associated with NODE.  Return 0 on success.
+   Returns EPERM if the lock is not locked by the current thread.  */
+
+static int
+unlock_node (Tkey_Data *node)
+{
+  int result;
+
+  node->refcount--;
+  result = pthread_mutex_unlock (&node->thread_lock);
+  if (result != ESUCCESS)
+    node->refcount++;
+  return result;
+}
+
+/* Set the processwide data associated with KEY to PTR, and unlock
+   the lock associated with KEY.
+
+   On success, returns 0.  On failure, returns:
+
+   [EINVAL]  KEY was previously used to store thread-specific data.
+   [ENOMEM]  Out of memory, couldn't create node.
+   [EAGAIN]  The mutex associated with the new node couldn't be created.
+   [EPERM]   The lock was not locked by the current thread.
+*/
+
+int
+_keymgr_set_and_unlock_processwide_ptr (unsigned int key, void *ptr)
+{
+  Tkey_Data *keyArray;
+  int result;
+
+  result = get_or_create_key_element (key, NODE_PROCESSWIDE_PTR, &keyArray);
+  if (result != ESUCCESS)
+    return result;
+
+  keyArray->ptr = ptr;
+  return unlock_node (keyArray);
+}
+
+/* Unlock the lock associated with KEY.
+
+   On success, returns 0.  On failure, returns:
+
+   [EINVAL]  KEY was not previously used to store process-specific data.
+   [EPERM]   The lock was not locked by the current thread.
+*/
+
+int
+_keymgr_unlock_processwide_ptr (unsigned int key)
+{
+  Tkey_Data *keyArray;
+
+  keyArray = get_key_element (key, NODE_PROCESSWIDE_PTR);
+  if (keyArray == NULL)
+    return EINVAL;
+
+  return unlock_node (keyArray);
+}
+
+/* Set the locking mode of KEY to MODE.  This should not be done while
+   KEY is locked or another thread might be using KEY.
+
+   On success, returns 0.  On failure, returns:
+   [EINVAL]  KEY was previously used to store thread-specific data.
+   [ENOMEM]  Out of memory.
+   [EBUSY]   The mutex associated with the node was locked.
+*/
+
+int
+_keymgr_set_lockmode_processwide_ptr (unsigned int key, unsigned int mode)
+{
+  Tkey_Data *keyArray;
+  pthread_mutexattr_t attr;
+  int type;
+  int result;
+
+  result = get_or_create_key_element (key, NODE_PROCESSWIDE_PTR, &keyArray);
+  if (result != ESUCCESS)
+    return result;
+
+  if (mode == keyArray->flags)
+    return ESUCCESS;
+  
+  result = pthread_mutexattr_init (&attr);
+  if (result != ESUCCESS)
+    return result;
+  
+  if (mode == NM_ALLOW_RECURSION)
+    type = PTHREAD_MUTEX_RECURSIVE;
+  else
+    type = PTHREAD_MUTEX_ERRORCHECK;
+  pthread_mutexattr_settype (&attr, type);
+  
+  /* Delete the old mutex and create a new one.  */
+  result = pthread_mutex_destroy (&keyArray->thread_lock);
+  /* Apple's implementation of pthread_mutex_init can't fail in this
+     situation.  */
+  if (result == ESUCCESS)
+    result = pthread_mutex_init (&keyArray->thread_lock, &attr);
+
+  pthread_mutexattr_destroy (&attr);
+
+  if (result == ESUCCESS)
+    keyArray->flags = mode;
+  return result;
+}
 	
-     
-     _init_keymgr() ; /*confirm keymgr has been initialized.*/
+/* Returns the locking mode of the lock associated with KEY, if any,
+   or 0 if there is no such lock.  */
 
-	retptr = _keymgr_get_and_lock_key(key,NODE_PROCESSWIDE_PTR) ;
-	
-		
-	return(retptr) ;
+unsigned int
+_keymgr_get_lockmode_processwide_ptr (unsigned int key)
+{
+  Tkey_Data *keyArray;
 
-	}
-	
-	
-	
+  keyArray = get_key_element (key, NODE_PROCESSWIDE_PTR);
+  if (keyArray == NULL)
+    return 0;
+  return keyArray->flags;
+}
 
-void _keymgr_set_and_unlock_processwide_ptr(unsigned int key, void *ptr) {
+/* Return the number of locks on KEY.  To call this routine safely,
+   you should be holding one of them, thus 0 is an error return.  */
 
+int
+_keymgr_get_lock_count_processwide_ptr (unsigned int key)
+{
+  Tkey_Data *keyArray;
 
-     
-     _init_keymgr() ; /*confirm keymgr has been initialized.*/
-
-	_keymgr_set_and_unlock_key(key,ptr,NODE_PROCESSWIDE_PTR) ;
-
-	}
-	
-	
-
-void _keymgr_unlock_processwide_ptr(unsigned int key) {
-
-     
-     _init_keymgr() ; /*confirm keymgr has been initialized.*/
-
-	_keymgr_unlock_key(key) ;
-	
-	}
-	
-
-void _keymgr_set_lockmode_processwide_ptr(unsigned int key, unsigned int mode) {
-
-    _Tkey_Data *keyArray ;
-
-     
-     _init_keymgr() ; /*confirm keymgr has been initialized.*/
-
-	keyArray = _keymgr_get_or_create_key_element(key,NODE_PROCESSWIDE_PTR) ;
-	
-	keyArray->flags = (keyArray->flags & ~NM_ENHANCED_LOCKING) | mode ;
-	}
-	
-	
-unsigned int  _keymgr_get_lockmode_processwide_ptr(unsigned int key) {
-
-    _Tkey_Data *keyArray ;
-
-     
-     _init_keymgr() ; /*confirm keymgr has been initialized.*/
-
-	keyArray = _keymgr_get_or_create_key_element(key,NODE_PROCESSWIDE_PTR) ;
-	
-	return(keyArray->flags) ;
-	}
-	
-	
-
-int _keymgr_get_lock_count_processwide_ptr(unsigned int key) {
-
-    _Tkey_Data *keyArray ;
-
-     
-     _init_keymgr() ; /*confirm keymgr has been initialized.*/
-
-	keyArray = _keymgr_get_or_create_key_element(key,NODE_PROCESSWIDE_PTR) ;
-	
-	return(keyArray->refcount) ;
-	}
-	
-	
+  keyArray = get_key_element (key, NODE_PROCESSWIDE_PTR);
+  if (keyArray == NULL)
+    return 0;
+  return keyArray->refcount;
+}
 
 /*********************************************/
 
@@ -644,7 +583,10 @@ int _keymgr_get_lock_count_processwide_ptr(unsigned int key) {
    name of the mach_header struct, this will do instead.  */
 
 struct mach_header;
-extern char *getsectdatafromheader();
+extern char *getsectdatafromheader ();
+
+/* This isn't in any header.  */
+extern void __cxa_finalize (void *); /* Defined in Libc */
 
 /* Beware, this is an API.  */
 
@@ -654,7 +596,7 @@ struct __live_images {
   unsigned long vm_slide;
   void (*destructor)(struct __live_images *);	/* destructor for this  */
   struct __live_images *next;
-  unsigned int examined_p;
+  unsigned long examined_p;
   void *fde;
   void *object_info;
   unsigned long info[2];			/* GCC3 use  */
@@ -672,6 +614,7 @@ enum {
 					image list.  */
 };
 
+#ifdef __ppc__
 struct old_object
 {
   void *pc_begin;
@@ -685,6 +628,7 @@ struct old_object
 
 static const char __DWARF2_UNWIND_SECTION_TYPE[] = "__TEXT";
 static const char __DWARF2_UNWIND_SECTION_NAME[] = "__dwarf2_unwind";
+#endif
 
 /* Called by dyld when an image is added to the executable.
    If it has a dwarf2_unwind section, register it so the C++ runtime
@@ -693,10 +637,12 @@ static const char __DWARF2_UNWIND_SECTION_NAME[] = "__dwarf2_unwind";
 static void dwarf2_unwind_dyld_add_image_hook (struct mach_header *mh,
                                                unsigned long vm_slide)
 {
+#ifdef __ppc__
   unsigned long sz;
   char *fde;
 
-  /* See if the image has a __TEXT __dwarf2_unwind section.  */
+  /* See if the image has a __TEXT __dwarf2_unwind section.  This
+     is for backwards compatibility with old GCCs.  */
 
   fde = getsectdatafromheader (mh, __DWARF2_UNWIND_SECTION_TYPE,
 				   __DWARF2_UNWIND_SECTION_NAME, &sz);
@@ -706,27 +652,29 @@ static void dwarf2_unwind_dyld_add_image_hook (struct mach_header *mh,
       struct old_object *obp;
 
       obp = (struct old_object *) calloc (1, sizeof (struct old_object) + 8);
+      if (obp == NULL)
+	return;
 
-      obp->pc_begin = obp->pc_end = 0;
-      obp->fde_array = 0;
-      obp->count = 0;
       obp->section_size = sz;
       obp->fde_begin = (struct dwarf_fde *) (fde + vm_slide);
 
-      obp->next = (struct old_object *)
-                _keymgr_get_and_lock_processwide_ptr (KEYMGR_ZOE_IMAGE_LIST);
-
-      _keymgr_set_and_unlock_processwide_ptr (KEYMGR_ZOE_IMAGE_LIST, obp);
+      if (_keymgr_get_and_lock_processwide_ptr_2 (KEYMGR_ZOE_IMAGE_LIST,
+						  (void **) &obp->next) == 0)
+	_keymgr_set_and_unlock_processwide_ptr (KEYMGR_ZOE_IMAGE_LIST, obp);
     }
+#endif
 
   {
-    struct __live_images *l = (struct __live_images *)calloc (1, sizeof (*l));
+    struct __live_images *l = (struct __live_images *) calloc (1, sizeof (*l));
+    if (l == NULL)
+      return;
+
     l->mh = mh;
     l->vm_slide = vm_slide;
     l->this_size = sizeof (*l);
-    l->next = (struct __live_images *)
-      _keymgr_get_and_lock_processwide_ptr (KEYMGR_GCC3_LIVE_IMAGE_LIST);
-    _keymgr_set_and_unlock_processwide_ptr (KEYMGR_GCC3_LIVE_IMAGE_LIST, l);
+    if (_keymgr_get_and_lock_processwide_ptr_2 (KEYMGR_GCC3_LIVE_IMAGE_LIST,
+						(void **) &l->next) == 0)
+      _keymgr_set_and_unlock_processwide_ptr (KEYMGR_GCC3_LIVE_IMAGE_LIST, l);
   }
 }
 
@@ -734,6 +682,7 @@ static void
 dwarf2_unwind_dyld_remove_image_hook (struct mach_header *mh,
 				      unsigned long vm_slide)
 {
+#ifdef __ppc__
   unsigned long sz;
   char *fde;
 
@@ -744,9 +693,10 @@ dwarf2_unwind_dyld_remove_image_hook (struct mach_header *mh,
   if (fde != 0)
     {
       struct old_object *objlist, **obp;
-
-      objlist = (struct old_object *)
-	 _keymgr_get_and_lock_processwide_ptr (KEYMGR_ZOE_IMAGE_LIST);
+ 
+      if (_keymgr_get_and_lock_processwide_ptr_2 (KEYMGR_ZOE_IMAGE_LIST,
+						  (void **) &objlist) != 0)
+	goto get_zoe_failed;
 
       for (obp = &objlist; *obp; obp = &(*obp)->next)
         if ((char *)(*obp)->fde_begin == fde + vm_slide)
@@ -760,7 +710,13 @@ dwarf2_unwind_dyld_remove_image_hook (struct mach_header *mh,
           }
 
       _keymgr_set_and_unlock_processwide_ptr (KEYMGR_ZOE_IMAGE_LIST, objlist);
+    get_zoe_failed:
+      ;
     }
+#endif
+
+    /* Execute anything on the atexit list that calls into this image. */
+    __cxa_finalize (mh);
 
   {
     struct __live_images *top, **lip, *destroy = NULL;
@@ -770,29 +726,31 @@ dwarf2_unwind_dyld_remove_image_hook (struct mach_header *mh,
        one or two objects and are consecutive in the list.  */
     void (*prev_destructor)(struct __live_images *) = NULL;
     int was_in_object = 0;
-    
-    /* Look for it in the list of live images and delete it.  
+
+    /* Look for it in the list of live images and delete it.
        Also, call any destructors in case they are in this image and about
        to be unloaded.  The test with DESTRUCTOR_MAY_BE_CALLED_LIVE is
        because in GCC 3.1, the destructor would (uselessly) try to acquire
        the LIVE_IMAGE_LIST lock, and it's not practical to call it in
        that case (deadlock ensues, unless we release the lock, in which
        case the concurrency issues become impossible).  */
-    
-    top = (struct __live_images *)
-      _keymgr_get_and_lock_processwide_ptr (KEYMGR_GCC3_LIVE_IMAGE_LIST);
+
+    if (_keymgr_get_and_lock_processwide_ptr_2 (KEYMGR_GCC3_LIVE_IMAGE_LIST,
+						(void **) &top) != 0)
+      goto get_live_image_failed;
+      
     lip = &top;
-    
+
     while (*lip != NULL)
       {
-	if ((*lip)->destructor 
+	if ((*lip)->destructor
 	    && ((*lip)->examined_p & DESTRUCTOR_MAY_BE_CALLED_LIVE))
 	  {
 	    if (! was_in_object && (*lip)->destructor != prev_destructor)
 	      {
 		prev_destructor = (*lip)->destructor;
 		was_in_object = ((_dyld_get_image_header_containing_address
-				  ((long) prev_destructor)) 
+				  ((long) prev_destructor))
 				 == mh);
 	      }
 	    if ((*lip)->destructor == prev_destructor && was_in_object)
@@ -803,17 +761,17 @@ dwarf2_unwind_dyld_remove_image_hook (struct mach_header *mh,
 	  {
 	    destroy = *lip;
 	    *lip = destroy->next;                 /* unlink DESTROY  */
-	    
+	
 	    if (destroy->this_size != sizeof (*destroy))  /* sanity check  */
 	      abort ();
-	    
+	
 	    continue;
 	  }
 	lip = &(*lip)->next;
       }
     _keymgr_set_and_unlock_processwide_ptr (KEYMGR_GCC3_LIVE_IMAGE_LIST, top);
-    
-    /* Now that we have unlinked this from the image list, toss it.  
+
+    /* Now that we have unlinked this from the image list, toss it.
        The destructor gets called here only to handle the GCC 3.1 case.  */
     if (destroy != NULL)
       {
@@ -821,6 +779,8 @@ dwarf2_unwind_dyld_remove_image_hook (struct mach_header *mh,
 	  (*destroy->destructor) (destroy);
 	free (destroy);
       }
+  get_live_image_failed:
+    ;
   }
 }
 

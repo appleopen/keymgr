@@ -28,8 +28,6 @@ Software Foundation, 59 Temple Place - Suite 330, Boston, MA
 #ifndef __KEYMGR_H
 #define __KEYMGR_H
 
-#ifdef MACOSX
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -42,37 +40,22 @@ extern "C" {
  *
  */
  
-typedef enum node_kinds {
-	NODE_THREAD_SPECIFIC_DATA=1,
-	NODE_PROCESSWIDE_PTR=2,
-	NODE_LAST_KIND
-	} TnodeKind ;
+enum {
+  NM_ALLOW_RECURSION = 1,
+  NM_RECURSION_ILLEGAL = 2
+};
 	
-/*
- * These enum members are bits or combination of bits.
- */
-	
-typedef enum node_mode {
-	NM_ALLOW_RECURSION=1,
-	NM_RECURSION_ILLEGAL=2,
-	NM_ENHANCED_LOCKING=3,
-	NM_LOCKED=4
-	} TnodeMode ;
-
-
-
-extern void * _keymgr_get_per_thread_data(unsigned int key) ;
-extern void _keymgr_set_per_thread_data(unsigned int key, void *keydata) ;
-extern void *_keymgr_get_and_lock_processwide_ptr(unsigned int key) ;
-extern void _keymgr_set_and_unlock_processwide_ptr(unsigned int key, void *ptr) ;
-extern void _keymgr_unlock_processwide_ptr(unsigned int key) ;
-extern void _keymgr_set_lockmode_processwide_ptr(unsigned int key, unsigned int mode) ;
-extern unsigned int  _keymgr_get_lockmode_processwide_ptr(unsigned int key) ;
-extern int _keymgr_get_lock_count_processwide_ptr(unsigned int key) ;
-
-#ifndef NULL
-#define NULL (0)
-#endif
+extern void * _keymgr_get_per_thread_data (unsigned int key);
+extern int _keymgr_set_per_thread_data (unsigned int key, void *keydata);
+extern void *_keymgr_get_and_lock_processwide_ptr (unsigned int key);
+extern int _keymgr_get_and_lock_processwide_ptr_2 (unsigned int key, void **);
+extern int _keymgr_set_and_unlock_processwide_ptr (unsigned int key, 
+						   void *ptr);
+extern int _keymgr_unlock_processwide_ptr (unsigned int key);
+extern int _keymgr_set_lockmode_processwide_ptr (unsigned int key, 
+						 unsigned int mode);
+extern unsigned int _keymgr_get_lockmode_processwide_ptr (unsigned int key);
+extern int _keymgr_get_lock_count_processwide_ptr (unsigned int key);
 
 /*
  * Keys currently in use:
@@ -112,15 +95,13 @@ extern int _keymgr_get_lock_count_processwide_ptr(unsigned int key) ;
  * Other important data.
  */
  
-#define KEYMGR_API_REV_MAJOR		3	/*Major revision number of the keymgr API.*/
-#define KEYMGR_API_REV_MINOR		0	/*Minor revision number of the keymgr API.*/
-
-
+/* Major revision number of the keymgr API.  */
+#define KEYMGR_API_REV_MAJOR		4
+/* Minor revision number of the keymgr API.  */
+#define KEYMGR_API_REV_MINOR		0
 
 #ifdef __cplusplus
 }
 #endif
-
-#endif /* MACOSX */
 
 #endif /* __KEYMGR_H */
