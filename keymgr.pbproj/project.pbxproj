@@ -6,8 +6,6 @@
 	objectVersion = 39;
 	objects = {
 		05036BFE03D7612400C9149F = {
-			buildRules = (
-			);
 			buildSettings = {
 				GCC_ENABLE_FIX_AND_CONTINUE = NO;
 				ZERO_LINK = NO;
@@ -41,6 +39,7 @@
 				055110D1061A2F89000F34F9,
 			);
 			buildRules = (
+				B14394D2071DE39C0051A444,
 			);
 			buildSettings = {
 				DYLIB_COMPATIBILITY_VERSION = 1;
@@ -50,6 +49,7 @@
 				GCC_GENERATE_DEBUGGING_SYMBOLS = NO;
 				GCC_PREPROCESSOR_DEFINITIONS = "MACOSX PART_OF_SYSTEM_FRAMEWORK";
 				GCC_TREAT_WARNINGS_AS_ERRORS = YES;
+				HEADER_SEARCH_PATHS = /System/Library/Frameworks/System.framework/PrivateHeaders;
 				INSTALL_PATH = /usr/local/lib/system;
 				LIBRARY_STYLE = STATIC;
 				OTHER_CFLAGS = "";
@@ -119,6 +119,7 @@
 				055110DA061A2F8A000F34F9,
 			);
 			buildRules = (
+				B14394D3071DE3A20051A444,
 			);
 			buildSettings = {
 				DYLIB_COMPATIBILITY_VERSION = 1;
@@ -128,6 +129,7 @@
 				GCC_OPTIMIZATION_LEVEL = 0;
 				GCC_PREPROCESSOR_DEFINITIONS = "MACOSX PART_OF_SYSTEM_FRAMEWORK";
 				GCC_TREAT_WARNINGS_AS_ERRORS = YES;
+				HEADER_SEARCH_PATHS = /System/Library/Frameworks/System.framework/PrivateHeaders;
 				INSTALL_PATH = /usr/local/lib/system;
 				LIBRARY_STYLE = STATIC;
 				OTHER_CFLAGS = "";
@@ -198,6 +200,7 @@
 				055110E3061A2F8A000F34F9,
 			);
 			buildRules = (
+				B14394D4071DE3AA0051A444,
 			);
 			buildSettings = {
 				DYLIB_COMPATIBILITY_VERSION = 1;
@@ -208,6 +211,7 @@
 				GCC_GENERATE_PROFILING_CODE = YES;
 				GCC_PREPROCESSOR_DEFINITIONS = "MACOSX PART_OF_SYSTEM_FRAMEWORK";
 				GCC_TREAT_WARNINGS_AS_ERRORS = YES;
+				HEADER_SEARCH_PATHS = /System/Library/Frameworks/System.framework/PrivateHeaders;
 				INSTALL_PATH = /usr/local/lib/system;
 				LIBRARY_STYLE = STATIC;
 				OTHER_CFLAGS = "";
@@ -374,6 +378,40 @@
 			path = "testcases/basic-eh-app.cc";
 			refType = 4;
 			sourceTree = "<group>";
+		};
+//050
+//051
+//052
+//053
+//054
+//B10
+//B11
+//B12
+//B13
+//B14
+		B14394D2071DE39C0051A444 = {
+			compilerSpec = com.apple.compilers.gcc.3_5;
+			fileType = sourcecode.c;
+			isEditable = 1;
+			isa = PBXBuildRule;
+			outputFiles = (
+			);
+		};
+		B14394D3071DE3A20051A444 = {
+			compilerSpec = com.apple.compilers.gcc.3_5;
+			fileType = sourcecode.c;
+			isEditable = 1;
+			isa = PBXBuildRule;
+			outputFiles = (
+			);
+		};
+		B14394D4071DE3AA0051A444 = {
+			compilerSpec = com.apple.compilers.gcc.3_5;
+			fileType = sourcecode.c;
+			isEditable = 1;
+			isa = PBXBuildRule;
+			outputFiles = (
+			);
 		};
 	};
 	rootObject = 0597689003D6465000C9149F;

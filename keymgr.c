@@ -1,4 +1,4 @@
-/* Copyright (C) 1999, 2000, 2001, 2002, 2003 Apple Computer, Inc.
+/* Copyright (C) 1999, 2000, 2001, 2002, 2003, 2004, 2005 Apple Computer, Inc.
    Copyright (C) 1997, 2001 Free Software Foundation, Inc.
 
 This file is part of KeyMgr.
@@ -38,7 +38,10 @@ Software Foundation, 59 Temple Place - Suite 330, Boston, MA
 
 #include <mach-o/dyld.h>
 #include <pthread.h>
+#include <errno.h>
 #include <stdlib.h>
+#include <libkern/OSAtomic.h>
+#include <stdint.h>
 #include "keymgr.h"
 
 #ifndef ESUCCESS
@@ -105,10 +108,6 @@ struct {
   &keymgr_info
 };
 
-#define UNLOCK_KEYMGR_LIST_MUTEX()			\
-  (pthread_mutex_unlock (__keymgr_global.keymgr_mutex) 	\
-   ? (abort (), 0) : 0)
-
 #if defined(__ppc__) || defined(__i386__)
 /* Initialize keymgr.  */
 
@@ -119,114 +118,6 @@ void _init_keymgr (void)
 }
 #endif
 
-/* Helper routines for atomic operations.  These have to be ported
-   for each platform...  */
-#if defined (__ppc64__)
-static inline void *
-compare_and_swap (void * volatile * p, void *old, void *new) 
-{
-  void *result;
-  asm ("0:	ldarx %0,0,%2\n"
-       "	cmpd%I3 %0,%3\n"
-       "	bne 1f\n"
-       "	stdcx. %4,0,%2\n"
-       "	bne- 0b\n"
-       "1:"
-       : "=&r" (result), "+m"(*p)
-       : "b" (p), "rI" (old), "r" (new)
-       : "cr0");
-  return result;
-}
-
-static inline void
-atomic_list_insert (Tkey_Data * volatile *list_base,
-		    Tkey_Data * * next,
-		    Tkey_Data * current)
-{
-  Tkey_Data *temp;
-  asm ("0:	ldarx %0,0,%3\n"
-       "	std%U1%X1 %0,%1\n"
-       "	sync\n"
-       "	stdcx. %4,0,%3\n"
-       "	bne- 0b"
-       : "=&r" (temp), "=m" (*next), "+m" (*list_base)
-       : "b" (list_base), "r" (current));
-}
-
-#elif defined (__ppc__)
-static inline void *
-compare_and_swap (void * volatile * p, void *old, void *new) 
-{
-  void *result;
-  asm ("0:	lwarx %0,0,%2\n"
-       "	cmpw%I3 %0,%3\n"
-       "	bne 1f\n"
-       "	stwcx. %4,0,%2\n"
-       "	bne- 0b\n"
-       "1:"
-       : "=&r" (result), "+m"(*p)
-       : "b" (p), "rI" (old), "r" (new)
-       : "cr0");
-  return result;
-}
-
-static inline void
-atomic_list_insert (Tkey_Data * volatile *list_base,
-		    Tkey_Data * * next,
-		    Tkey_Data * current)
-{
-  Tkey_Data *temp;
-  asm ("0:	lwarx %0,0,%3\n"
-       "	stw%U1%X1 %0,%1\n"
-       "	sync\n"
-       "	stwcx. %4,0,%3\n"
-       "	bne- 0b"
-       : "=&r" (temp), "=m" (*next), "+m" (*list_base)
-       : "b" (list_base), "r" (current));
-}
-
-#elif defined (__i386__)
-static inline void *
-compare_and_swap (void * volatile * p, void *old, void *new)
-{
-  void *result;
-  asm ("lock ; cmpxchgl %3,%1"
-       : "=a" (result), "+m"(*p)
-       : "0" (old), "r" (new));
-  return result;
-}
-
-static inline void
-atomic_list_insert (Tkey_Data * volatile *list_base,
-		    Tkey_Data * * next,
-		    Tkey_Data * current)
-{
-  do {
-    *next = *list_base;
-  } while (compare_and_swap ((void * volatile *)list_base, 
-			     *next, current) != *next);
-}
-#else
-#error architecture not supported
-#endif
-
-/* Helper routine for get_key_element and get_or_create_key_element.
-   Return the node corresponding to KEY, or NULL if none exists.  */
-
-static Tkey_Data *
-find_key_data (unsigned int key)
-{
-  Tkey_Data * keyArray;
-
-  for (keyArray = __keymgr_global.keymgr_globals;
-       keyArray != NULL;
-       keyArray = keyArray->next)
-    if (keyArray->handle == key)
-      break;
-
-  return keyArray;
-}
-
 /* Find any Tkey_Data associated with KEY.  If none exists, or KIND
    does not match, return NULL.  */
 
@@ -235,12 +126,18 @@ get_key_element (unsigned int key, TnodeKind kind)
 {
   Tkey_Data  *keyArray;
 
-  keyArray = find_key_data (key);
+  for (keyArray = __keymgr_global.keymgr_globals;
+       keyArray != NULL;
+       keyArray = keyArray->next)
+    if (keyArray->handle == key)
+      {
+	if (keyArray->node_kind == kind)
+	  return keyArray;
+	else
+	  return NULL;
+      }
 
-  if (keyArray != NULL && keyArray->node_kind != kind)
-    keyArray = NULL;
-
-  return keyArray;
+  return NULL;
 }
 
 /* Find any Tkey_Data associated with KEY.  If none exists, create one
@@ -251,59 +148,144 @@ get_key_element (unsigned int key, TnodeKind kind)
    [ENOMEM]  Out of memory, couldn't create node.
    [EAGAIN]  The mutex associated with the new node couldn't be created.
 	     This can only happen when KIND == NODE_PROCESSWIDE_PTR.
+
+   The aims of this routine are:
+	     
+   - After execution, there should be exactly one element in the list
+     with HANDLE set to KEY.
+   - The pointer to that element should be returned in *RESULT.
+
+   In addition, we know that:
+
+   - The list only has elements added, never removed, and they are
+     always added to the head of the list.
 */
 
 static int
 get_or_create_key_element (unsigned int key, TnodeKind kind, 
 			   Tkey_Data **result)
 {
-  Tkey_Data *keyArray;
-
-  keyArray = find_key_data (key);
-
-  if (keyArray == NULL)
+  Tkey_Data *searchEnd = NULL;
+  Tkey_Data *newEntry = NULL;
+  
+  for (;;)
     {
-      keyArray = (Tkey_Data *) malloc (sizeof (Tkey_Data));
-      if (keyArray == NULL)
-	return ENOMEM;
-      
-      if (keyArray != NULL
-	  && kind == NODE_PROCESSWIDE_PTR)
-	{
-	  pthread_mutexattr_t attr;
-	  int errnum;
-	  
-	  keyArray->refcount = 0;
-	  keyArray->flags = 0;
+      Tkey_Data *keyArrayStart = __keymgr_global.keymgr_globals;
+      Tkey_Data *keyArray;
 
-	  errnum = pthread_mutexattr_init (&attr);
-	  if (errnum == ESUCCESS)
+      /* At this point, we know that we have not searched the elements
+	 between keyArrayStart and searchEnd, but we have previously searched
+	 searchEnd (if not NULL) and all the elements after it.  */
+
+      for (keyArray = keyArrayStart;
+	   keyArray != searchEnd;
+	   keyArray = keyArray->next)
+	if (keyArray->handle == key)
+	  {
+	    /* Found an existing entry for KEY.  Free any new entry we
+	       created in a previous pass through the loop.  */
+	    if (newEntry)
+	      {
+		if (kind == NODE_PROCESSWIDE_PTR)
+		  /* This call should never fail.  */
+		  if (pthread_mutex_destroy (&newEntry->thread_lock)
+		      != ESUCCESS)
+		    abort ();
+		free (newEntry);
+	      }
+
+	    if (keyArray->node_kind != kind)
+	      return EINVAL;	  
+	    *result = keyArray;
+	    return ESUCCESS;
+	  }
+
+      /* At this point, we know that there is no entry after keyArrayStart
+	 which matches KEY.  We will try to add one.  */
+
+      if (! newEntry)
+	{
+	  /* Create the new entry.  */
+	  newEntry = (Tkey_Data *) malloc (sizeof (Tkey_Data));
+	  if (newEntry == NULL)
+	    return ENOMEM;
+      
+	  if (kind == NODE_PROCESSWIDE_PTR)
 	    {
-	      pthread_mutexattr_settype (&attr, PTHREAD_MUTEX_ERRORCHECK);
-	      errnum = pthread_mutex_init (&keyArray->thread_lock, &attr);
-	      pthread_mutexattr_destroy (&attr);
+	      pthread_mutexattr_t attr;
+	      int errnum;
+	      
+	      newEntry->refcount = 0;
+	      newEntry->flags = 0;
+	      
+	      errnum = pthread_mutexattr_init (&attr);
+	      if (errnum == ESUCCESS)
+		{
+		  pthread_mutexattr_settype (&attr, PTHREAD_MUTEX_ERRORCHECK);
+		  errnum = pthread_mutex_init (&newEntry->thread_lock, &attr);
+		  pthread_mutexattr_destroy (&attr);
+		}
+	      if (errnum != ESUCCESS)
+		{
+		  free (newEntry);
+		  return errnum;
+		}
 	    }
-	  if (errnum != ESUCCESS)
-	    {
-	      free (keyArray);
-	      return errnum;
-	    }
+	  
+	  newEntry->handle = key;
+	  newEntry->ptr = NULL;
+	  newEntry->node_kind = kind;
 	}
 
-      keyArray->handle = key;
-      keyArray->ptr = NULL;
-      keyArray->node_kind = kind;
-      atomic_list_insert (&__keymgr_global.keymgr_globals,
-			  &keyArray->next,
-			  keyArray);
+      /* The compare-and-swap will succeed only if the list head is
+	 keyArrayStart, and we are prepending newEntry onto the list,
+	 so the next element after newEntry should be keyArrayStart.  */
+
+      newEntry->next = keyArrayStart;
+
+      /* The barrier is necessary to ensure that newEntry->next is seen
+	 to be set by any thread that sees newEntry in the list.  */
+
+      /* If the compare-and-swap succeeds, it means that the head of
+	 the list did not change between the search above and the
+	 store of newEntry.  Therefore, since we searched all the
+	 elements from the head at that time, we can be sure that the
+	 entry we're adding is not in the list.  */
+#ifdef __ppc64__
+      if (OSAtomicCompareAndSwap64Barrier (
+			   (int64_t) keyArrayStart,
+			   (int64_t) newEntry,
+			   (int64_t *) &__keymgr_global.keymgr_globals))
+#elif defined (__i386__)
+      /* x86 should be the same as ppc, this is Radar 3719334.  */
+      if (OSAtomicCompareAndSwap32 (
+			   (int32_t) keyArrayStart,
+			   (int32_t) newEntry,
+			   (int32_t *) &__keymgr_global.keymgr_globals))
+#elif defined(__ppc__)
+      if (OSAtomicCompareAndSwap32Barrier (
+			   (int32_t) keyArrayStart,
+			   (int32_t) newEntry,
+			   (int32_t *) &__keymgr_global.keymgr_globals))
+#else
+#error unknown pointer size
+#endif
+	{
+	  *result = newEntry;
+	  return ESUCCESS;
+	}
+      /* Another thread changed the list.  The entries between
+	 keyArrayStart and searchEnd were searched above, so now we
+	 can stop searching at keyArrayStart.  We know we will make
+	 progress in the next loop iteration because the new searchEnd
+	 will not be equal to __keymgr_global.keymgr_globals and so we
+	 will search at least one new element.  Since the list can
+	 have at most one element for each valid key, eventually there
+	 will be no more elements to search and so we will stop reaching
+	 this point and looping.  */
+      searchEnd = keyArrayStart;
     }
-  else if (keyArray->node_kind != kind)
-    return EINVAL;
-  
-  *result = keyArray;
-  return ESUCCESS;
 }
-	
 
 /* Return the data associated with KEY for the current thread.
    Return NULL if there is no such data.  */
@@ -367,10 +349,12 @@ _keymgr_set_per_thread_data (unsigned int key, void *keydata)
   if (ptr == NULL)
     {
       void (*destructor)(void *);
+      bool neededInit;
 
       switch (key)
 	{
 	case KEYMGR_EH_CONTEXT_KEY:
+	case KEYMGR_EH_GLOBALS_KEY:
 	  destructor = free;
 	  break;
 	default:
@@ -379,12 +363,23 @@ _keymgr_set_per_thread_data (unsigned int key, void *keydata)
 	}
       if ((errnum = pthread_key_create (&pthread_key, destructor)) != 0)
 	return errnum;
-      ptr = compare_and_swap (&keyArray->ptr, NULL, (void *)pthread_key);
-      if (ptr != NULL)
+
+#ifdef __ppc64__
+      neededInit = OSAtomicCompareAndSwap64 ((int64_t) NULL,
+					     (int64_t) pthread_key,
+					     (int64_t *) &keyArray->ptr);
+#elif defined(__ppc__) || defined (__i386__)
+      neededInit = OSAtomicCompareAndSwap32 ((int32_t) NULL,
+					     (int32_t) pthread_key,
+					     (int32_t *) &keyArray->ptr);
+#else
+#error unknown pointer size
+#endif
+      if (!neededInit)
 	pthread_key_delete (pthread_key);
+      ptr = keyArray->ptr;
     }
-  if (ptr != NULL)
-    pthread_key = (pthread_key_t) ptr;
+  pthread_key = (pthread_key_t) ptr;
 
   return pthread_setspecific (pthread_key, keydata);
 }
@@ -578,22 +573,15 @@ _keymgr_get_lock_count_processwide_ptr (unsigned int key)
 
 /*********************************************/
 
-
-/* We *could* include <mach.h> here but since all we care about is the
-   name of the mach_header struct, this will do instead.  */
-
-struct mach_header;
-extern char *getsectdatafromheader ();
-
-/* This isn't in any header.  */
-extern void __cxa_finalize (void *); /* Defined in Libc */
+#include <mach-o/getsect.h>
+#include <atexit.h>
 
 /* Beware, this is an API.  */
 
 struct __live_images {
   unsigned long this_size;			/* sizeof (__live_images)  */
-  struct mach_header *mh;			/* the image info  */
-  unsigned long vm_slide;
+  const struct mach_header *mh;			/* the image info  */
+  intptr_t vm_slide;
   void (*destructor)(struct __live_images *);	/* destructor for this  */
   struct __live_images *next;
   unsigned long examined_p;
@@ -634,11 +622,11 @@ static const char __DWARF2_UNWIND_SECTION_NAME[] = "__dwarf2_unwind";
    If it has a dwarf2_unwind section, register it so the C++ runtime
    can get at it.  All of this is protected by dyld thread locks.  */
 
-static void dwarf2_unwind_dyld_add_image_hook (struct mach_header *mh,
-                                               unsigned long vm_slide)
+static void dwarf2_unwind_dyld_add_image_hook (const struct mach_header *mh,
+                                               intptr_t vm_slide)
 {
 #ifdef __ppc__
-  unsigned long sz;
+  uint32_t sz;
   char *fde;
 
   /* See if the image has a __TEXT __dwarf2_unwind section.  This
@@ -679,11 +667,11 @@ static void dwarf2_unwind_dyld_add_image_hook (struct mach_header *mh,
 }
 
 static void
-dwarf2_unwind_dyld_remove_image_hook (struct mach_header *mh,
-				      unsigned long vm_slide)
+dwarf2_unwind_dyld_remove_image_hook (const struct mach_header *mh,
+				      intptr_t vm_slide)
 {
 #ifdef __ppc__
-  unsigned long sz;
+  uint32_t sz;
   char *fde;
 
   /* See if the image has a __TEXT __dwarf2_unwind section.  */
@@ -750,7 +738,7 @@ dwarf2_unwind_dyld_remove_image_hook (struct mach_header *mh,
 	      {
 		prev_destructor = (*lip)->destructor;
 		was_in_object = ((_dyld_get_image_header_containing_address
-				  ((long) prev_destructor))
+				  (prev_destructor))
 				 == mh);
 	      }
 	    if ((*lip)->destructor == prev_destructor && was_in_object)
